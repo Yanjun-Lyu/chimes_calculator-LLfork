@@ -109,7 +109,7 @@ PairCHIMES::PairCHIMES(LAMMPS *lmp) : Pair(lmp)
 	d_dx_4b=nullptr; d_dr_4b=nullptr; d_typ_4b=nullptr; d_ai_4b=nullptr; d_aj_4b=nullptr; d_ak_4b=nullptr; d_al_4b=nullptr;
 	d_forces_out=nullptr; d_energy_out=nullptr;
 	h_forces_out=nullptr; h_energy_gpu=0.0;
-	out_natoms=0; gpu_ready=false;
+	out_natoms=0; gpu_ready=false; gpu_device_id=-1;
 #endif
 	
 	if (chimes_calculator.rank == 0)
@@ -240,6 +240,7 @@ void PairCHIMES::coeff(int narg, char **arg)
 	maxcut_4b = chimes_calculator.max_cutoff_4B();
 
 #ifdef USE_CUDA
+	select_gpu_device();
 	chimes_calculator.upload_params_to_device();
 	init_gpu_buffers();
 	if (chimes_calculator.rank == 0)
@@ -890,6 +891,54 @@ if (vflag_fdotr)
         exit(EXIT_FAILURE); \
     } \
 } while(0)
+
+// Bind this rank to one GPU on its node, splitting node-local ranks
+// round-robin across the devices CUDA can see (e.g. 28 ranks / 2 GPUs on
+// an rtx-small node -> ranks 0,2,4,...  -> GPU 0, ranks 1,3,5,... -> GPU 1).
+// Computed once per process (static cache) so repeated calls -- e.g. from
+// a second hybrid/overlay chimesFF layer -- are cheap and consistent.
+void PairCHIMES::select_gpu_device()
+{
+    static bool done      = false;
+    static int  device_id = 0;
+
+    if (!done)
+    {
+        int ngpus = 0;
+        cudaError_t gerr = cudaGetDeviceCount(&ngpus);
+        if (gerr != cudaSuccess || ngpus <= 0)
+        {
+            if (comm->me == 0)
+                fprintf(stderr,
+                    "chimesFF: WARNING no CUDA devices visible (%s); defaulting to device 0\n",
+                    cudaGetErrorString(gerr));
+            ngpus = 1;
+        }
+
+        // Node-local rank: how many ranks on this same node come before us.
+        // Requires MPI-3 (MPI_Comm_split_type); falls back to the global
+        // rank on MPI stub / older-MPI builds (correct only for single-node jobs).
+        int local_rank = comm->me;
+#ifdef MPI_COMM_TYPE_SHARED
+        MPI_Comm shm_comm;
+        if (MPI_Comm_split_type(world, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &shm_comm) == MPI_SUCCESS)
+        {
+            MPI_Comm_rank(shm_comm, &local_rank);
+            MPI_Comm_free(&shm_comm);
+        }
+#endif
+
+        device_id = local_rank % ngpus;
+        done = true;
+
+        std::cout << "chimesFF: rank " << comm->me << " (node-local rank " << local_rank
+                  << ") of " << comm->nprocs << " bound to GPU device " << device_id
+                  << " of " << ngpus << " visible" << std::endl;
+    }
+
+    gpu_device_id = device_id;
+    PC_CUDA_CHECK(cudaSetDevice(gpu_device_id));
+}
 
 void PairCHIMES::init_gpu_buffers()
 {

@@ -85,6 +85,29 @@ ChIMES parameters (coefficients, cutoffs, Morse lambdas, type maps) are
 uploaded to GPU constant memory **once** after `pair_coeff` and reused for
 every timestep.
 
+### Multi-rank / multi-GPU device binding
+
+Each MPI rank calls `cudaSetDevice()` once, before any other CUDA call, to
+bind itself to a GPU. Ranks are split **round-robin across node-local
+ranks** (an MPI-3 `MPI_Comm_split_type(MPI_COMM_TYPE_SHARED, ...)` call
+determines each rank's position on its node; that position modulo the
+number of visible devices selects the GPU). For example, on an `rtx-small`
+node (2 GPUs) with `N` MPI ranks:
+
+- `N = 2`: rank 0 → GPU 0, rank 1 → GPU 1
+- `N = 28`: ranks 0,2,4,...,26 → GPU 0; ranks 1,3,5,...,27 → GPU 1 (14 ranks/GPU)
+
+This is logged once per rank at `pair_coeff` time, e.g.:
+
+```text
+chimesFF: rank 3 (node-local rank 3) of 28 bound to GPU device 1 of 2 visible
+```
+
+Without this, every rank defaults to CUDA device 0, leaving additional GPUs
+idle and causing contention on device 0 at higher rank counts. Note this
+only assigns devices — it does not yet skip GPU initialization on ranks
+with no local ChIMES work (e.g. pure-Ar-bath ranks in a hybrid/overlay run).
+
 ### Requirements
 
 - NVIDIA GPU with Compute Capability ≥ 6.0 (Pascal or newer — see table below)

@@ -135,6 +135,12 @@ namespace LAMMPS_NS
 		// GPU batch-evaluation path (compiled only with USE_CUDA)
 		// --------------------------------------------------------
 #ifdef USE_CUDA
+		// Bind this MPI rank to one GPU on its node (round-robin across
+		// node-local ranks, e.g. 28 ranks / 2 GPUs -> 14 ranks per device).
+		// Called once from coeff(), before any other CUDA call.
+		void select_gpu_device();
+		int  gpu_device_id;      // device index this rank was bound to (-1 if unset)
+
 		// Called from coeff() after parameter upload; safe to call again.
 		void init_gpu_buffers();
 		// Called from destructor.
