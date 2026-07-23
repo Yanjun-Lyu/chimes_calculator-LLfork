@@ -3202,6 +3202,105 @@ void chimesFF::upload_params_to_device()
 
     int    fcut_type_int = (fcut_type == fcutType::CUBIC) ? 0 : 1;
 
+    // ----- Optional tabulation tables -----
+    int tab2_flag = 0, tab3_flag = 0;
+    vector<int>    h_tab2_npts, h_tab2_offset;
+    vector<double> h_tab2_r, h_tab2_e, h_tab2_f;
+    vector<int>    h_tab3_N, h_tab3_offset, h_tab3_pair_lex;
+    vector<double> h_tab3_r0, h_tab3_dr_inv, h_tab3_e, h_tab3_fij, h_tab3_fik, h_tab3_fjk;
+
+#ifdef TABULATION
+    if (tabulate_2B) {
+        tab2_flag = 1;
+        if ((int)tab_r.size() != n_pairs || (int)tab_e.size() != n_pairs || (int)tab_f.size() != n_pairs) {
+            cout << "chimesFF GPU: ERROR: tabulated 2B table count does not match n_pairs" << endl;
+            exit(1);
+        }
+        h_tab2_npts.resize(n_pairs);
+        h_tab2_offset.resize(n_pairs + 1, 0);
+        int tot = 0;
+        for (int p = 0; p < n_pairs; p++) {
+            h_tab2_offset[p] = tot;
+            h_tab2_npts[p]   = (int)tab_r[p].size();
+            tot += h_tab2_npts[p];
+        }
+        h_tab2_offset[n_pairs] = tot;
+        h_tab2_r.resize(tot);
+        h_tab2_e.resize(tot);
+        h_tab2_f.resize(tot);
+        for (int p = 0; p < n_pairs; p++) {
+            int base = h_tab2_offset[p];
+            for (int i = 0; i < h_tab2_npts[p]; i++) {
+                h_tab2_r[base + i] = tab_r[p][i];
+                h_tab2_e[base + i] = tab_e[p][i];
+                h_tab2_f[base + i] = tab_f[p][i];
+            }
+        }
+        if (rank == 0)
+            cout << "chimesFF: Uploading tabulated 2B tables to GPU (" << tot << " points)" << endl;
+    }
+
+    if (tabulate_3B) {
+        tab3_flag = 1;
+        if ((int)tab_e_3B.size() != n_trips) {
+            cout << "chimesFF GPU: ERROR: tabulated 3B table count does not match n_trips" << endl;
+            exit(1);
+        }
+        h_tab3_N.resize(n_trips);
+        h_tab3_r0.resize(n_trips);
+        h_tab3_dr_inv.resize(n_trips);
+        h_tab3_offset.resize(n_trips + 1, 0);
+        h_tab3_pair_lex.resize(n_trips * 3, 0);
+
+        // Lex ranks for pair-type strings (stable sort key in get_tab_3B)
+        map<string, int> pair_lex;
+        int next_lex = 0;
+        for (int t = 0; t < n_trips; t++) {
+            for (int p = 0; p < 3; p++) {
+                const string &s = trip_params_pair_typs[t][p];
+                if (pair_lex.find(s) == pair_lex.end())
+                    pair_lex[s] = next_lex++;
+                h_tab3_pair_lex[t * 3 + p] = pair_lex[s];
+            }
+        }
+
+        int tot = 0;
+        for (int t = 0; t < n_trips; t++) {
+            int npts = (int)tab_e_3B[t].size();
+            int N = (int)lround(cbrt((double)npts));
+            if (N * N * N != npts) {
+                cout << "chimesFF GPU: ERROR: 3B table for trip " << t
+                     << " is not a cubic grid (npts=" << npts << ")" << endl;
+                exit(1);
+            }
+            int size_ik = N;
+            int size_ij = N * N;
+            h_tab3_N[t]      = N;
+            h_tab3_r0[t]     = tab_rij_3B[t][0];
+            h_tab3_dr_inv[t] = 1.0 / (tab_rjk_3B[t][size_ij + size_ik + 1] - tab_rjk_3B[t][0]);
+            h_tab3_offset[t] = tot;
+            tot += npts;
+        }
+        h_tab3_offset[n_trips] = tot;
+        h_tab3_e.resize(tot);
+        h_tab3_fij.resize(tot);
+        h_tab3_fik.resize(tot);
+        h_tab3_fjk.resize(tot);
+        for (int t = 0; t < n_trips; t++) {
+            int base = h_tab3_offset[t];
+            int npts = h_tab3_N[t] * h_tab3_N[t] * h_tab3_N[t];
+            for (int i = 0; i < npts; i++) {
+                h_tab3_e  [base + i] = tab_e_3B[t][i];
+                h_tab3_fij[base + i] = tab_f_ij_3B[t][i];
+                h_tab3_fik[base + i] = tab_f_ik_3B[t][i];
+                h_tab3_fjk[base + i] = tab_f_jk_3B[t][i];
+            }
+        }
+        if (rank == 0)
+            cout << "chimesFF: Uploading tabulated 3B tables to GPU (" << tot << " points)" << endl;
+    }
+#endif
+
     // ----- Call the CUDA upload function -----
 
     chimesFF_gpu_upload_params_flat(
@@ -3223,7 +3322,22 @@ void chimesFF::upload_params_to_device()
         atom_int_quad_map.empty() ? nullptr : atom_int_quad_map.data(), quad_map_size,
         h_piq.data(), quad_map_size,
         natmtyps, fcut_type_int, fcut_var,
-        penalty_params.data()
+        penalty_params.data(),
+        tab2_flag, tab3_flag,
+        tab2_flag ? h_tab2_npts.data()   : nullptr,
+        tab2_flag ? h_tab2_offset.data() : nullptr,
+        tab2_flag ? h_tab2_r.data()      : nullptr,
+        tab2_flag ? h_tab2_e.data()      : nullptr,
+        tab2_flag ? h_tab2_f.data()      : nullptr,
+        tab3_flag ? h_tab3_N.data()        : nullptr,
+        tab3_flag ? h_tab3_r0.data()       : nullptr,
+        tab3_flag ? h_tab3_dr_inv.data()   : nullptr,
+        tab3_flag ? h_tab3_offset.data()   : nullptr,
+        tab3_flag ? h_tab3_e.data()        : nullptr,
+        tab3_flag ? h_tab3_fij.data()      : nullptr,
+        tab3_flag ? h_tab3_fik.data()      : nullptr,
+        tab3_flag ? h_tab3_fjk.data()      : nullptr,
+        tab3_flag ? h_tab3_pair_lex.data() : nullptr
     );
 }
 

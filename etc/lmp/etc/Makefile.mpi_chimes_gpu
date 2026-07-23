@@ -1,9 +1,9 @@
-# mpi_chimes_gpu = MPI + ChIMES + CUDA GPU acceleration
+# mpi_chimes_gpu = MPI + ChIMES + CUDA GPU acceleration (+ TABULATION)
 #
 # Usage:
 #   Pre-build the ChIMES GPU static library (chimesFF_gpu.o + dlink.o) with
-#   install_gpu.sh, then this Makefile compiles LAMMPS with -DUSE_CUDA and
-#   links against those objects plus the CUDA runtime.
+#   install_gpu.sh, then this Makefile compiles LAMMPS with -DUSE_CUDA
+#   -DTABULATION and links against those objects plus the CUDA runtime.
 #
 #   CUDA_PATH must point to the CUDA toolkit root (e.g. export CUDA_PATH=/usr/local/cuda)
 #   CHIMES_GPU_LIB must point to the pre-built GPU archive  (set by install_gpu.sh)
@@ -14,7 +14,7 @@ SHELL = /bin/sh
 # compiler/linker settings
 
 CC         = mpicxx
-CCFLAGS    = -O3 -std=c++11 -DUSE_CUDA -DMAX_POLY_ORDER=24 \
+CCFLAGS    = -O3 -std=c++11 -DUSE_CUDA -DTABULATION -DMAX_POLY_ORDER=24 \
              -I$(CUDA_PATH)/include
 SHFLAGS    = -fPIC
 DEPFLAGS   = -M

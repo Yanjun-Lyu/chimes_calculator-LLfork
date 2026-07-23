@@ -243,8 +243,13 @@ void PairCHIMES::coeff(int narg, char **arg)
 	select_gpu_device();
 	chimes_calculator.upload_params_to_device();
 	init_gpu_buffers();
-	if (chimes_calculator.rank == 0)
+	if (chimes_calculator.rank == 0) {
 		std::cout << "chimesFF: GPU acceleration enabled (USE_CUDA build)." << std::endl;
+#ifdef TABULATION
+		std::cout << "chimesFF: TABULATION enabled — tabulated 2B/3B use GPU table kernels;"
+		             " 4B uses GPU Chebyshev." << std::endl;
+#endif
+	}
 #endif
 }
 void writeClusterDataComp(const string& filename, const vector<vector<double>>& data) 
@@ -538,18 +543,15 @@ void PairCHIMES::compute(int eflag, int vflag)
 
 	// ------------------------------------------------------------------
 	// GPU fast path: bypass per-cluster CPU loops.
-	// Requirements: GPU buffers ready, no TABULATION, no FINGERPRINT,
-	// and no per-atom energy/virial (eflag_atom / vflag_atom).
-	// When any of those conditions is unmet we fall through to the
-	// original CPU path below unchanged.
+	// Requirements: GPU buffers ready, no FINGERPRINT, and no per-atom
+	// energy/virial (eflag_atom / vflag_atom).
+	// With TABULATION, 2B/3B use GPU table lookup kernels; 4B stays on the
+	// GPU Chebyshev path. Without TABULATION (or non-tabulated models),
+	// 2B/3B/4B all use GPU Chebyshev kernels.
 	// ------------------------------------------------------------------
 #ifdef USE_CUDA
 	{
 		bool use_gpu = gpu_ready && !eflag_atom && !vflag_atom;
-#ifdef TABULATION
-		if (chimes_calculator.tabulate_2B || chimes_calculator.tabulate_3B)
-			use_gpu = false;
-#endif
 #ifdef FINGERPRINT
 		if (fingerprint) use_gpu = false;
 #endif

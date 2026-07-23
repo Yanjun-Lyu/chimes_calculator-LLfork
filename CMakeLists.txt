@@ -71,7 +71,7 @@ target_compile_definitions(ChimesCalc PRIVATE "DEBUG=${DEBUG}")
 target_compile_features(ChimesCalc PRIVATE cxx_std_11)
 
 if(WITH_CUDA)
-    target_compile_definitions(ChimesCalc PRIVATE USE_CUDA)
+    target_compile_definitions(ChimesCalc PRIVATE USE_CUDA TABULATION)
     set_property(TARGET ChimesCalc PROPERTY CUDA_ARCHITECTURES ${CUDA_ARCH})
     target_compile_options(ChimesCalc PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:-O3 --expt-relaxed-constexpr -Xcompiler -fPIC>)
@@ -83,7 +83,7 @@ if(WITH_CUDA)
         "chimesFF/src/chimesFF_gpu.cu")
     target_include_directories(chimescalc-gpu-validate PRIVATE
         "chimesFF/src")
-    target_compile_definitions(chimescalc-gpu-validate PRIVATE USE_CUDA "DEBUG=0")
+    target_compile_definitions(chimescalc-gpu-validate PRIVATE USE_CUDA TABULATION "DEBUG=0")
     target_compile_features(chimescalc-gpu-validate PRIVATE cxx_std_14)
     set_property(TARGET chimescalc-gpu-validate PROPERTY CUDA_ARCHITECTURES ${CUDA_ARCH})
     target_compile_options(chimescalc-gpu-validate PRIVATE
@@ -147,7 +147,7 @@ target_compile_definitions(ChimesCalc_dynamic PRIVATE "DEBUG=${DEBUG}")
 target_compile_features(ChimesCalc_dynamic PRIVATE cxx_std_11)
 
 if(WITH_CUDA)
-    target_compile_definitions(ChimesCalc_dynamic PRIVATE USE_CUDA)
+    target_compile_definitions(ChimesCalc_dynamic PRIVATE USE_CUDA TABULATION)
     set_property(TARGET ChimesCalc_dynamic PROPERTY CUDA_ARCHITECTURES ${CUDA_ARCH})
     target_compile_options(ChimesCalc_dynamic PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:-O3 --expt-relaxed-constexpr -Xcompiler -fPIC>)

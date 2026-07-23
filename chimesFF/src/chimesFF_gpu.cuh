@@ -42,7 +42,24 @@ void chimesFF_gpu_upload_params_flat(
     const int   * piq,          int piq_size,               // pair_int_quad flat [natmtyps^4*6]
     // --- shared ---
     int natmtyps, int fcut_type, double fcut_var,           // fcut_type: 0=CUBIC 1=TERSOFF
-    const double* penalty                                   // [2]: A_pen, d_pen
+    const double* penalty,                                  // [2]: A_pen, d_pen
+    // --- optional tabulation (pass nullptr / 0 when unused) ---
+    int           tabulate_2B,
+    int           tabulate_3B,
+    const int   * tab2_npts,        // [n_pairs]
+    const int   * tab2_offset,      // [n_pairs+1] prefix sum into flat arrays
+    const double* tab2_r,           // flat rij grid
+    const double* tab2_e,           // flat energies
+    const double* tab2_f,           // flat force scalars
+    const int   * tab3_N,           // [n_trips] cubic grid edge length
+    const double* tab3_r0,          // [n_trips]
+    const double* tab3_dr_inv,      // [n_trips]
+    const int   * tab3_offset,      // [n_trips+1] into flat N^3 arrays
+    const double* tab3_e,           // flat energies
+    const double* tab3_fij,
+    const double* tab3_fik,
+    const double* tab3_fjk,
+    const int   * tab3_pair_lex     // [n_trips*3] lex ranks of pair-type strings for sorting
 );
 
 // Free all device memory allocated by chimesFF_gpu_upload_params_flat().

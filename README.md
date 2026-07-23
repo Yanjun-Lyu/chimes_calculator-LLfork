@@ -174,8 +174,32 @@ automatically when:
 - The build was compiled with `USE_CUDA`, and
 - No per-atom energy/virial output is requested (i.e. `eflag_atom = vflag_atom = 0`).
 
-If per-atom thermodynamic quantities or `TABULATION`/`FINGERPRINT` mode are
-requested, the code falls back silently to the original CPU path.
+If per-atom thermodynamic quantities or `FINGERPRINT` mode are requested, the
+code falls back silently to the original CPU path.
+
+### Combining GPU acceleration with tabulation
+
+`install_gpu.sh` builds with both `-DUSE_CUDA` and `-DTABULATION`. When the
+parameter file marks 2B/3B interactions as `TABULATED` (with companion
+`*.energy` / `*.force` table files next to the parameter file), those body
+orders evaluate via GPU table-lookup kernels instead of Chebyshev polynomials.
+4-body terms remain on the GPU Chebyshev path (4B is never tabulated).
+
+Workflow:
+
+1. Generate tables with `util/tabulator` (same as the CPU-tabulated workflow).
+2. Point `PAIRTYPE` / triplet lines at `TABULATED <stem>` in the parameter file.
+3. Build with `./install_gpu.sh <SM_ARCH>` and run as usual — no input-script
+   changes beyond using the tabulated parameter file and placing table files
+   where the parameter file expects them.
+
+Non-tabulated models continue to use GPU Chebyshev for 2B/3B/4B. Mixed
+tabulated/non-tabulated pairs within the same body order are not supported
+(same restriction as the CPU tabulation path).
+
+> **Note:** Tabulated forces/energies are expected to include the short-range
+> penalty contribution (as in the CPU tabulator). The GPU tab kernels do not
+> re-apply the penalty.
 
 ### GPU vs CPU validation test
 

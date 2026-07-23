@@ -27,6 +27,11 @@
 #   CUDA_ARCH (optional) - SM architecture number, default 90 (H100).
 #                          Use 80 for A100, 86 for A30/A40, 89 for L40S.
 #
+# Builds with BOTH -DUSE_CUDA and -DTABULATION so 2B/3B can use GPU table
+# lookups when the parameter file marks pairs/triplets as TABULATED; 4B
+# remains on the GPU Chebyshev path. Non-tabulated models still use GPU
+# Chebyshev for 2B/3B/4B.
+#
 # Output:
 #   exe/lmp_mpi_chimes_gpu
 
@@ -36,7 +41,7 @@ CUDA_ARCH="${1:-90}"
 
 echo ""
 echo "=========================================================="
-echo " ChIMES + CUDA LAMMPS build"
+echo " ChIMES + CUDA + TABULATION LAMMPS build"
 echo " CUDA SM architecture: sm_${CUDA_ARCH}"
 echo "=========================================================="
 echo ""
@@ -135,6 +140,7 @@ nvcc -O3 \
      -std=c++11 \
      -Xcompiler -fPIC \
      -DUSE_CUDA \
+     -DTABULATION \
      -DMAX_POLY_ORDER=24 \
      -I"${REPO_ROOT}/chimesFF/src" \
      -I"${CUDA_PATH}/include" \

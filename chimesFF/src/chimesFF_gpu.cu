@@ -26,9 +26,13 @@
       Blackwell are SM 8.0/9.0/12.0, so this is unconditionally correct
       on Stampede3 rtx-small and h100 partitions.
     • Per-thread stack size: k3B and k4B allocate ~1.5 KB and ~3 KB of
-      thread-local Chebyshev arrays, exceeding the CUDA default 1 KB per-
-      thread stack.  cudaDeviceSetLimit(cudaLimitStackSize, 8192) is called
-      in chimesFF_gpu_upload_params_flat() to raise the limit to 8 KB.
+      thread-local Chebyshev arrays; k3B_tab uses ~2 KB Catmull–Rom stencils,
+      exceeding the CUDA default 1 KB per-thread stack.
+      cudaDeviceSetLimit(cudaLimitStackSize, 16384) is called in
+      chimesFF_gpu_upload_params_flat() to raise the limit to 16 KB.
+    • Optional TABULATION: when -DTABULATION is set and the parameter file
+      marks 2B/3B as TABULATED, k2B_tab / k3B_tab replace the Chebyshev
+      kernels for those body orders (4B stays Chebyshev).
     • Batch pre-allocation (pair_chimes.cpp): the LAMMPS caller pre-sizes
       all host batch arrays (h_dx_2b, h_typ_3b, etc.) to their full count
       before the fill loop.  An earlier grow-on-demand design deleted and
@@ -71,6 +75,8 @@ struct GPUParams {
     int     order_2b, order_3b, order_4b;
     int     natmtyps, fcut_type;   // fcut_type: 0=CUBIC  1=TERSOFF
     double  fcut_var;
+    int     tabulate_2B;           // 1 => use table kernels for 2B
+    int     tabulate_3B;           // 1 => use table kernels for 3B
 
     // 2B
     int    *d_ncoeffs_2b, *d_offset_2b, *d_pows_2b;
@@ -91,13 +97,23 @@ struct GPUParams {
 
     // Penalty
     double *d_penalty;                               // [2]: A_pen, d_pen
+
+    // Tabulation (optional; nullptr when unused)
+    int    *d_tab2_npts;                             // [n_pairs]
+    int    *d_tab2_offset;                           // [n_pairs+1]
+    double *d_tab2_r, *d_tab2_e, *d_tab2_f;
+    int    *d_tab3_N;                                // [n_trips]
+    double *d_tab3_r0, *d_tab3_dr_inv;
+    int    *d_tab3_offset;                           // [n_trips+1]
+    double *d_tab3_e, *d_tab3_fij, *d_tab3_fik, *d_tab3_fjk;
+    int    *d_tab3_pair_lex;                         // [n_trips*3]
 };
 
 __constant__ GPUParams c_p;  // device-side read-only copy
 
 // Host mirror for teardown tracking
 static GPUParams  g_host_params;
-static void      *g_allocs[64];
+static void      *g_allocs[96];
 static int        g_n_allocs = 0;
 static bool       g_initialized = false;
 
@@ -267,6 +283,83 @@ __global__ void k2B(int np,
 }
 
 // ============================================================
+// 2-body tabulated kernel (cubic spline; matches CPU get_tab_2B)
+// Penalty is assumed baked into the tables (CPU tab path does not
+// re-apply it to energy/force).
+// ============================================================
+
+__device__ double tab2_interp(int pidx, double rij, bool for_energy)
+{
+    const int n   = c_p.d_tab2_npts[pidx];
+    const int off = c_p.d_tab2_offset[pidx];
+    const double * __restrict__ r = c_p.d_tab2_r + off;
+    const double * __restrict__ y = (for_energy ? c_p.d_tab2_e : c_p.d_tab2_f) + off;
+
+    // lower_bound on r
+    int lo = 0, hi = n;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (r[mid] < rij) lo = mid + 1;
+        else              hi = mid;
+    }
+    int i = lo;
+    if (i == n) return 0.0;
+    if (i == 0) return 0.0;                 // below table (CPU exits; treat as 0 on GPU)
+    if (rij == r[i] && i > 0) i--;
+    if (i >= n - 1 || i <= 0) return 0.0;
+
+    double h     = r[i + 1] - r[i];
+    double alpha = (3.0 * (y[i + 1] - y[i]) / h)
+                 - (3.0 * (y[i] - y[i - 1]) / (r[i] - r[i - 1]));
+    double l     = 2.0 * (r[i + 1] - r[i - 1]) - h;
+    double mu    = h / l;
+    double z     = alpha / l;
+    double c_prev = 0.0;
+    double c = z - mu * c_prev;
+    double b = (y[i + 1] - y[i]) / h - h * (c + 2.0 * c_prev) / 3.0;
+    double d = (c - c_prev) / (3.0 * h);
+    double a = y[i];
+    double dx = rij - r[i];
+    return a + b * dx + c * dx * dx + d * dx * dx * dx;
+}
+
+__global__ void k2B_tab(int np,
+                        const double * __restrict__ dx,
+                        const double * __restrict__ dr,
+                        const int    * __restrict__ typ,
+                        const int    * __restrict__ ai,
+                        const int    * __restrict__ aj,
+                        double       * __restrict__ forces,
+                        double       * __restrict__ energy)
+{
+    int pid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pid >= np) return;
+
+    double dxp = dx[pid];
+    double drx = dr[pid*3+0], dry = dr[pid*3+1], drz = dr[pid*3+2];
+    int    ti  = typ[pid*2+0], tj = typ[pid*2+1];
+    int    a_i = ai[pid],       a_j = aj[pid];
+
+    int N    = c_p.natmtyps;
+    int pidx = c_p.d_pair_map[ti * N + tj];
+    if (pidx < 0) return;
+
+    double rmax = c_p.d_cutoff_2b[pidx*2+1];
+    if (dxp >= rmax) return;
+
+    double eloc = tab2_interp(pidx, dxp, true);
+    double fs   = tab2_interp(pidx, dxp, false);
+
+    atomicAdd(&forces[a_i*3+0],  fs * drx);
+    atomicAdd(&forces[a_i*3+1],  fs * dry);
+    atomicAdd(&forces[a_i*3+2],  fs * drz);
+    atomicAdd(&forces[a_j*3+0], -fs * drx);
+    atomicAdd(&forces[a_j*3+1], -fs * dry);
+    atomicAdd(&forces[a_j*3+2], -fs * drz);
+    atomicAdd(energy, eloc);
+}
+
+// ============================================================
 // 3-body kernel
 // ============================================================
 
@@ -374,6 +467,162 @@ __global__ void k3B(int nt,
     atomicAdd(&forces[a_j*3+0], fj0); atomicAdd(&forces[a_j*3+1], fj1); atomicAdd(&forces[a_j*3+2], fj2);
     atomicAdd(&forces[a_k*3+0], fk0); atomicAdd(&forces[a_k*3+1], fk1); atomicAdd(&forces[a_k*3+2], fk2);
     atomicAdd(energy, eloc);
+}
+
+// ============================================================
+// 3-body tabulated kernel (Catmull–Rom tricubic; matches CPU
+// get_tab_3B / interpolateTricubic). Pair-type lex ranks drive
+// axis sorting; force scalars are remapped to physical ij/ik/jk.
+// ============================================================
+
+__device__ double cubic_interp(double p0, double p1, double p2, double p3, double x)
+{
+    return p1 + 0.5 * x * (p2 - p0 + x * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3
+           + x * (3.0 * (p1 - p2) + p3 - p0)));
+}
+
+__device__ double bicubic_interp(const double *p, double x, double y)
+{
+    double arr[4];
+    for (int i = 0; i < 4; i++)
+        arr[i] = cubic_interp(p[i*4+0], p[i*4+1], p[i*4+2], p[i*4+3], x);
+    return cubic_interp(arr[0], arr[1], arr[2], arr[3], y);
+}
+
+__device__ double tricubic_interp(const double *p, double x, double y, double z)
+{
+    double arr[4];
+    for (int i = 0; i < 4; i++)
+        arr[i] = bicubic_interp(p + i * 16, x, y);
+    return cubic_interp(arr[0], arr[1], arr[2], arr[3], z);
+}
+
+__device__ void tab3_interp(int tripidx, double rij, double rik, double rjk,
+                            double &eout, double &fij, double &fik, double &fjk)
+{
+    const int N   = c_p.d_tab3_N[tripidx];
+    const int off = c_p.d_tab3_offset[tripidx];
+    const double r0     = c_p.d_tab3_r0[tripidx];
+    const double dr_inv = c_p.d_tab3_dr_inv[tripidx];
+    const int size_ik = N;
+    const int size_ij = N * N;
+
+    const double * __restrict__ ye  = c_p.d_tab3_e   + off;
+    const double * __restrict__ yij = c_p.d_tab3_fij + off;
+    const double * __restrict__ yik = c_p.d_tab3_fik + off;
+    const double * __restrict__ yjk = c_p.d_tab3_fjk + off;
+
+    int i = (int)((rij - r0) * dr_inv);
+    int j = (int)((rik - r0) * dr_inv);
+    int k = (int)((rjk - r0) * dr_inv);
+    if (i < 1) i = 1;
+    if (j < 1) j = 1;
+    if (k < 1) k = 1;
+
+    double values[64], values1[64], values2[64], values3[64];
+    #pragma unroll
+    for (int t = 0; t < 64; t++) {
+        values[t] = values1[t] = values2[t] = values3[t] = 0.0;
+    }
+
+    for (int di = -1; di <= 2; ++di) {
+        for (int dj = -1; dj <= 2; ++dj) {
+            for (int dk = -1; dk <= 2; ++dk) {
+                int temp_i = i + di;
+                int temp_j = j + dj;
+                int temp_k = k + dk;
+                if (temp_i < size_ik && temp_j < size_ik && temp_k < size_ik) {
+                    int index = size_ij * temp_i + size_ik * temp_j + temp_k;
+                    int idx   = (di + 1) * 16 + (dj + 1) * 4 + (dk + 1);
+                    values [idx] = ye [index];
+                    values1[idx] = yij[index];
+                    values2[idx] = yik[index];
+                    values3[idx] = yjk[index];
+                }
+            }
+        }
+    }
+
+    // Fractional coords (match CPU: uses stored grid coords at [i,j,k])
+    // r0 + i/dr_inv ≈ tab_rij[i*size_ij + ...]; use analytic form
+    double xi = (rij - (r0 + i / dr_inv)) * dr_inv;
+    double yi = (rik - (r0 + j / dr_inv)) * dr_inv;
+    double zi = (rjk - (r0 + k / dr_inv)) * dr_inv;
+
+    eout = tricubic_interp(values,  zi, yi, xi);
+    fij  = tricubic_interp(values1, zi, yi, xi);
+    fik  = tricubic_interp(values2, zi, yi, xi);
+    fjk  = tricubic_interp(values3, zi, yi, xi);
+}
+
+__global__ void k3B_tab(int nt,
+                        const double * __restrict__ dx,
+                        const double * __restrict__ dr,
+                        const int    * __restrict__ typ,
+                        const int    * __restrict__ ai,
+                        const int    * __restrict__ aj,
+                        const int    * __restrict__ ak,
+                        double       * __restrict__ forces,
+                        double       * __restrict__ energy)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= nt) return;
+
+    int N  = c_p.natmtyps;
+    int ti = typ[tid*3+0], tj = typ[tid*3+1], tk = typ[tid*3+2];
+    int a_i = ai[tid], a_j = aj[tid], a_k = ak[tid];
+
+    int type_idx = ti*N*N + tj*N + tk;
+    int tripidx  = c_p.d_trip_map[type_idx];
+    if (tripidx < 0) return;
+
+    int mpi0 = c_p.d_pit[type_idx*3+0];
+    int mpi1 = c_p.d_pit[type_idx*3+1];
+    int mpi2 = c_p.d_pit[type_idx*3+2];
+
+    double dxij = dx[tid*3+0], dxik = dx[tid*3+1], dxjk = dx[tid*3+2];
+
+    double rmax0 = c_p.d_cutoff_3b[tripidx*6 + 1*3 + mpi0];
+    double rmax1 = c_p.d_cutoff_3b[tripidx*6 + 1*3 + mpi1];
+    double rmax2 = c_p.d_cutoff_3b[tripidx*6 + 1*3 + mpi2];
+    if (dxij >= rmax0 || dxik >= rmax1 || dxjk >= rmax2) return;
+
+    // Sort by pair-type lex rank (matches CPU get_tab_3B)
+    int lex0 = c_p.d_tab3_pair_lex[tripidx*3 + mpi0];
+    int lex1 = c_p.d_tab3_pair_lex[tripidx*3 + mpi1];
+    int lex2 = c_p.d_tab3_pair_lex[tripidx*3 + mpi2];
+
+    double d0 = dxij, d1 = dxik, d2 = dxjk;
+    int    o0 = 0,    o1 = 1,    o2 = 2;
+    // Stable insertion sort by (lex, keep order on ties)
+    if (lex1 < lex0) { int tl=lex0; lex0=lex1; lex1=tl; double td=d0; d0=d1; d1=td; int to=o0; o0=o1; o1=to; }
+    if (lex2 < lex1) { int tl=lex1; lex1=lex2; lex2=tl; double td=d1; d1=d2; d2=td; int to=o1; o1=o2; o2=to; }
+    if (lex1 < lex0) { int tl=lex0; lex0=lex1; lex1=tl; double td=d0; d0=d1; d1=td; int to=o0; o0=o1; o1=to; }
+
+    double eout, fs_s0, fs_s1, fs_s2;
+    tab3_interp(tripidx, d0, d1, d2, eout, fs_s0, fs_s1, fs_s2);
+
+    double fs[3];
+    fs[o0] = fs_s0; fs[o1] = fs_s1; fs[o2] = fs_s2;
+
+    double drij0 = dr[tid*9+0], drij1 = dr[tid*9+1], drij2 = dr[tid*9+2];
+    double drik0 = dr[tid*9+3], drik1 = dr[tid*9+4], drik2 = dr[tid*9+5];
+    double drjk0 = dr[tid*9+6], drjk1 = dr[tid*9+7], drjk2 = dr[tid*9+8];
+
+    double fi0 = fs[0]*drij0 + fs[1]*drik0;
+    double fi1 = fs[0]*drij1 + fs[1]*drik1;
+    double fi2 = fs[0]*drij2 + fs[1]*drik2;
+    double fj0 = -fs[0]*drij0 + fs[2]*drjk0;
+    double fj1 = -fs[0]*drij1 + fs[2]*drjk1;
+    double fj2 = -fs[0]*drij2 + fs[2]*drjk2;
+    double fk0 = -fs[1]*drik0 - fs[2]*drjk0;
+    double fk1 = -fs[1]*drik1 - fs[2]*drjk1;
+    double fk2 = -fs[1]*drik2 - fs[2]*drjk2;
+
+    atomicAdd(&forces[a_i*3+0], fi0); atomicAdd(&forces[a_i*3+1], fi1); atomicAdd(&forces[a_i*3+2], fi2);
+    atomicAdd(&forces[a_j*3+0], fj0); atomicAdd(&forces[a_j*3+1], fj1); atomicAdd(&forces[a_j*3+2], fj2);
+    atomicAdd(&forces[a_k*3+0], fk0); atomicAdd(&forces[a_k*3+1], fk1); atomicAdd(&forces[a_k*3+2], fk2);
+    atomicAdd(energy, eout);
 }
 
 // ============================================================
@@ -522,21 +771,29 @@ void chimesFF_gpu_upload_params_flat(
     const int *quad_map, int quad_map_size,
     const int *piq, int piq_size,
     int natmtyps, int fcut_type, double fcut_var,
-    const double *penalty)
+    const double *penalty,
+    int tabulate_2B, int tabulate_3B,
+    const int *tab2_npts, const int *tab2_offset,
+    const double *tab2_r, const double *tab2_e, const double *tab2_f,
+    const int *tab3_N, const double *tab3_r0, const double *tab3_dr_inv,
+    const int *tab3_offset,
+    const double *tab3_e, const double *tab3_fij, const double *tab3_fik, const double *tab3_fjk,
+    const int *tab3_pair_lex)
 {
     // Free any previously uploaded parameters
     if (g_initialized) chimesFF_gpu_free_params();
 
     // k3B allocates ~1.5 KB and k4B ~3 KB of thread-local (stack) storage for
-    // Chebyshev arrays.  The CUDA default per-thread stack is only 1 KB, which
-    // causes a silent stack overflow and an illegal-memory-access in those kernels.
-    // Set 8 KB per thread so all three body-order kernels have headroom.
-    CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 8192));
+    // Chebyshev arrays.  Tabulated 3B uses ~2 KB for Catmull–Rom stencils.
+    // The CUDA default per-thread stack is only 1 KB.
+    CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 16384));
 
     GPUParams hp = {};  // host-side params struct to fill with device pointers
     hp.n_pairs  = n_pairs;  hp.n_trips  = n_trips;  hp.n_quads  = n_quads;
     hp.order_2b = order_2b; hp.order_3b = order_3b; hp.order_4b = order_4b;
     hp.natmtyps = natmtyps; hp.fcut_type = fcut_type; hp.fcut_var = fcut_var;
+    hp.tabulate_2B = tabulate_2B;
+    hp.tabulate_3B = tabulate_3B;
 
     // --- 2B ---
     hp.d_ncoeffs_2b = upload(ncoeffs_2b, n_pairs);
@@ -576,6 +833,32 @@ void chimesFF_gpu_upload_params_flat(
     }
 
     hp.d_penalty = upload(penalty, 2);
+
+    // --- Tabulation (optional) ---
+    if (tabulate_2B && tab2_npts && tab2_offset && tab2_r && tab2_e && tab2_f) {
+        hp.d_tab2_npts   = upload(tab2_npts,   n_pairs);
+        hp.d_tab2_offset = upload(tab2_offset, n_pairs + 1);
+        int tab2_total = tab2_offset[n_pairs];
+        if (tab2_total > 0) {
+            hp.d_tab2_r = upload(tab2_r, tab2_total);
+            hp.d_tab2_e = upload(tab2_e, tab2_total);
+            hp.d_tab2_f = upload(tab2_f, tab2_total);
+        }
+    }
+    if (tabulate_3B && n_trips > 0 && tab3_N && tab3_offset && tab3_e) {
+        hp.d_tab3_N        = upload(tab3_N,        n_trips);
+        hp.d_tab3_r0       = upload(tab3_r0,       n_trips);
+        hp.d_tab3_dr_inv   = upload(tab3_dr_inv,   n_trips);
+        hp.d_tab3_offset   = upload(tab3_offset,   n_trips + 1);
+        hp.d_tab3_pair_lex = upload(tab3_pair_lex, n_trips * 3);
+        int tab3_total = tab3_offset[n_trips];
+        if (tab3_total > 0) {
+            hp.d_tab3_e   = upload(tab3_e,   tab3_total);
+            hp.d_tab3_fij = upload(tab3_fij, tab3_total);
+            hp.d_tab3_fik = upload(tab3_fik, tab3_total);
+            hp.d_tab3_fjk = upload(tab3_fjk, tab3_total);
+        }
+    }
 
     // Copy struct of device pointers to constant memory
     CUDA_CHECK(cudaMemcpyToSymbol(c_p, &hp, sizeof(GPUParams)));
@@ -618,8 +901,13 @@ void chimesFF_gpu_compute_2B(
     if (npairs <= 0) return;
     int tpb    = 256;
     int blocks = (npairs + tpb - 1) / tpb;
-    k2B<<<blocks, tpb>>>(npairs, d_dx, d_dr, d_typ, d_ai, d_aj, d_forces, d_energy);
-    CUDA_KERNEL_CHECK("k2B");
+    if (g_host_params.tabulate_2B) {
+        k2B_tab<<<blocks, tpb>>>(npairs, d_dx, d_dr, d_typ, d_ai, d_aj, d_forces, d_energy);
+        CUDA_KERNEL_CHECK("k2B_tab");
+    } else {
+        k2B<<<blocks, tpb>>>(npairs, d_dx, d_dr, d_typ, d_ai, d_aj, d_forces, d_energy);
+        CUDA_KERNEL_CHECK("k2B");
+    }
 }
 
 void chimesFF_gpu_compute_3B(
@@ -631,8 +919,13 @@ void chimesFF_gpu_compute_3B(
     if (ntriplets <= 0) return;
     int tpb    = 128;
     int blocks = (ntriplets + tpb - 1) / tpb;
-    k3B<<<blocks, tpb>>>(ntriplets, d_dx, d_dr, d_typ, d_ai, d_aj, d_ak, d_forces, d_energy);
-    CUDA_KERNEL_CHECK("k3B");
+    if (g_host_params.tabulate_3B) {
+        k3B_tab<<<blocks, tpb>>>(ntriplets, d_dx, d_dr, d_typ, d_ai, d_aj, d_ak, d_forces, d_energy);
+        CUDA_KERNEL_CHECK("k3B_tab");
+    } else {
+        k3B<<<blocks, tpb>>>(ntriplets, d_dx, d_dr, d_typ, d_ai, d_aj, d_ak, d_forces, d_energy);
+        CUDA_KERNEL_CHECK("k3B");
+    }
 }
 
 void chimesFF_gpu_compute_4B(
